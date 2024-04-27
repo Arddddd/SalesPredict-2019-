@@ -1,0 +1,873 @@
+import gc
+import math
+import re
+import time
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import LabelEncoder
+import matplotlib.pyplot as plt
+
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+import xgboost
+from xgboost import XGBRegressor
+from sklearn.metrics import accuracy_score
+
+import os
+
+# os.chdir(r'/Users/liuguangkun/Desktop/海王销售')
+os.chdir(r'C:\Users\user\Desktop\聚均科技大数据中心文档目录\海王销售模型')
+
+import pymysql
+
+
+def querysql(dbname='hw'):
+    '''连接MySQL数据库'''
+    host = '10.30.4.101'
+    user = 'jjkj_admin'
+    pw = 'P@ssw0rd'
+    return pymysql.connect(host=host, user=user, passwd=pw, db=dbname, charset='utf8')
+
+
+def get_table(dbname='hw', dataname='FB_U_SALEORDER', keywords='*'):
+    '''获取表'''
+    starttime = time.time()
+    data = pd.read_sql('''SELECT ''' + keywords + ''' FROM ''' + dataname.upper(), querysql(dbname=dbname))
+    # del data['id']
+    print(time.time() - starttime)
+    return data
+
+
+def filter_extreme_percentile(series, min=0.01, max=0.99):
+    '''百分位法去极值'''
+    q = series.quantile([min, max])
+    return np.clip(series, q.iloc[0], q.iloc[1])
+
+
+def groupcount(df, colname):
+    '''customno pk_org itemno'''
+    df['count-' + colname] = len(df[colname].unique())
+    return df
+
+
+def groupsum(df, colname):
+    '''beds nastnum ntaxmny'''
+    ''' 'count-customno', 'count-pk_org','count-itemno', 'sum-beds', 'sum-nastnum', 'sum-ntaxmny' '''
+    df['sum-' + colname] = np.nansum(df[colname])
+    return df
+
+
+def groupstd(df, colname):
+    '''beds nastnum ntaxmny'''
+    ''' 'sum-nastnum', 'sum-ntaxmny' '''
+    df['std-' + colname] = np.nanstd(df[colname])
+    return df
+
+
+def groupcount2(df, colname):
+    '''city_code class_code billtype_code'''
+    t = df[colname].value_counts()
+    for i in range(len(t)):
+        df[colname + '_' + str(t.index[i])] = t.iloc[i]
+    return df
+
+
+'''#################################################### 数据 #########################################################'''
+
+# ### 销售订单表
+# # saleorder = get_table(dbname='hw_abs01_apr', dataname='FB_U_SALEORDER')
+# # transfer = get_table(dbname='hw_abs01', dataname='FB_U_TRANSFER')
+
+saleorder = pd.read_hdf(r'saleorder.h5')
+recbill = pd.read_hdf(r'recbill.h5')
+saleorder = saleorder[saleorder['customno'].isin(recbill['customno'])]
+names = []
+for i in saleorder.customname.drop_duplicates():
+    if re.findall(r".*（", i):
+        names.append((i, re.findall(r".*（", i)[0][:-1]))
+for name in names:
+    saleorder.loc[saleorder[saleorder['customname'] == name[0]].index, 'customname'] = name[1]
+# ### 药智医院信息表
+# # yz_hospital = get_table(dbname='shandong_hospital', dataname='YZ_HOSPITAL')
+yz_hospital = pd.read_hdf(r'yz_hospital.h5')
+
+# ### 合并
+saleorder = saleorder.merge(yz_hospital, on=['customname'], how='left')
+
+saleorder['everyday'] = [x[:10] for x in saleorder['dmakedate']]
+saleorder['year'] = [x[:4] for x in saleorder['dmakedate']]
+saleorder['month'] = [x[5:7] for x in saleorder['dmakedate']]
+saleorder['day'] = [x[8:10] for x in saleorder['dmakedate']]
+
+# ### 处理极值 None值
+saleorder.loc[saleorder['beds'][saleorder['beds'].isna()].index, 'beds'] = np.nan
+saleorder['beds'] = [int(x) if isinstance(x, str) else x for x in saleorder['beds']]
+
+# for colname in ['nastnum', 'ntaxmny']:  # 药品数 销售金额
+#     saleorder[colname + '_new'] = filter_extreme_percentile(saleorder[colname], min=0.01, max=0.99)
+
+'''################################################## 初步构造特征 #####################################################'''
+
+groupcols = ['everyday', 'city', 'custclass', 'billtypename']
+
+cols = ['everyday', 'year', 'month', 'day', 'city', 'custclass', 'billtypename', 'customno', 'pk_org',
+        'itemno', 'beds', 'nastnum', 'ntaxmny', 'id']
+temp = saleorder[~((saleorder['year'] == '2020') & (saleorder['month'] == '04'))].copy()
+temp = temp[cols].drop_duplicates()  # # id字段不能丢 temp['ntaxmny'].sum()=1165122603.78
+
+saleorder1 = temp.groupby(groupcols).apply(lambda x: groupcount(x, 'customno'))
+saleorder1 = saleorder1.groupby(groupcols).apply(lambda x: groupcount(x, 'pk_org'))
+saleorder1 = saleorder1.groupby(groupcols).apply(lambda x: groupcount(x, 'itemno'))
+
+saleorder1 = saleorder1.groupby(groupcols).apply(lambda x: groupsum(x, 'beds'))  # 床位数
+saleorder1 = saleorder1.groupby(groupcols).apply(lambda x: groupsum(x, 'nastnum'))  # 数量
+saleorder1 = saleorder1.groupby(groupcols).apply(lambda x: groupsum(x, 'ntaxmny'))  # 金额
+
+'''###################################################### data ######################################################'''
+
+saleorder = pd.read_hdf(r'saleorder2.h5')
+cols = ['everyday', 'year', 'month', 'day', 'city', 'custclass', 'billtypename', 'count-customno', 'count-pk_org',
+        'count-itemno', 'sum-beds', 'sum-nastnum', 'sum-ntaxmny']
+saleorder = saleorder[saleorder['everyday'] > '2017-12-31'][cols].drop_duplicates()
+
+# # saleorder1['sum-ntaxmny'].sum()=1165527336.0
+
+'''#################################################### 月度模型1 #####################################################'''
+
+
+def con_monthdf1(df):
+    df['city_code'] = LabelEncoder().fit_transform(df['city'])  # 0-8
+    df['class_code'] = LabelEncoder().fit_transform(df['custclass'])  # 0-4
+    df['billtype_code'] = LabelEncoder().fit_transform(df['billtypename'])  # 0-7
+    del df['city'], df['custclass'], df['billtypename']
+
+    groupcols2 = ['year', 'month']
+
+    df = df.groupby(groupcols2).apply(lambda x: groupcount2(x, 'city_code'))
+    df = df.groupby(groupcols2).apply(lambda x: groupcount2(x, 'class_code'))
+    df = df.groupby(groupcols2).apply(lambda x: groupcount2(x, 'billtype_code'))
+
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'count-customno'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'count-pk_org'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'count-itemno'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'sum-beds'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'sum-nastnum'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'sum-ntaxmny'))
+
+    df = df[['billtype_code_0', 'billtype_code_1', 'billtype_code_2', 'billtype_code_3', 'billtype_code_4',
+             'billtype_code_5', 'billtype_code_6', 'billtype_code_7',
+
+             'class_code_0', 'class_code_1', 'class_code_2', 'class_code_3', 'class_code_4',
+
+             'city_code_0', 'city_code_1', 'city_code_2', 'city_code_3',
+             'city_code_4', 'city_code_5', 'city_code_6', 'city_code_7', 'city_code_8',
+
+             'month', 'year',
+
+             'sum-count-customno', 'sum-count-pk_org', 'sum-count-itemno',
+
+             'sum-sum-beds', 'sum-sum-nastnum', 'sum-sum-ntaxmny']].drop_duplicates()
+
+    df = df[df['year'] > '2017']
+    df = df.fillna(0)
+    df = df.sort_values(['year', 'month']).reset_index(drop=True)
+    for x in df.columns:
+        df[x] = [int(i) for i in df[x]]  # # 全部改为数值型
+
+    # del df['year']
+
+    # split data into X and y
+    X = df.iloc[:, 0:len(df.columns) - 1]
+    Y = df.iloc[:, len(df.columns) - 1]
+
+    # 把数据集拆分成训练集和测试集
+    X_train = X.iloc[:24, :]
+    y_train = Y.iloc[:24]
+    X_test = X.iloc[24:, :]
+    y_test = Y.iloc[24:]
+
+    return X_train, y_train, X_test, y_test
+
+
+X_train, y_train, X_test, y_test = con_monthdf1(saleorder1.copy())
+
+'''#################################################### 月度模型2 #####################################################'''
+
+
+def con_monthdf2(df, n):
+    '''
+    df = saleorder.copy() 预测三个月n=3, 预测六个月n=6
+    '''
+    df['city_code'] = LabelEncoder().fit_transform(df['city'])  # 0-8
+    df['city_code'] += 1
+    df['class_code'] = LabelEncoder().fit_transform(df['custclass'])  # 0-4
+    df['class_code'] += 1
+    df['billtype_code'] = LabelEncoder().fit_transform(df['billtypename'])  # 0-7
+    df['billtype_code'] += 1
+    del df['city'], df['custclass'], df['billtypename']
+
+    groupcols2 = ['year', 'month']
+
+    df = df.groupby(groupcols2).apply(lambda x: groupcount2(x, 'city_code'))
+    df = df.groupby(groupcols2).apply(lambda x: groupcount2(x, 'class_code'))
+    df = df.groupby(groupcols2).apply(lambda x: groupcount2(x, 'billtype_code'))
+
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'count-customno'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'count-pk_org'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'count-itemno'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'sum-beds'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'sum-nastnum'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'sum-ntaxmny'))
+
+    df = df[['billtype_code_1', 'billtype_code_2', 'billtype_code_3', 'billtype_code_4',
+             'billtype_code_5', 'billtype_code_6', 'billtype_code_7', 'billtype_code_8',
+             'class_code_1', 'class_code_2', 'class_code_3', 'class_code_4', 'class_code_5',
+             'city_code_1', 'city_code_2', 'city_code_3',
+             'city_code_4', 'city_code_5', 'city_code_6', 'city_code_7', 'city_code_8', 'city_code_9',
+             'month', 'year',
+             'sum-count-customno', 'sum-count-pk_org', 'sum-count-itemno',
+             'sum-sum-beds', 'sum-sum-nastnum', 'sum-sum-ntaxmny']].drop_duplicates()
+
+    df = df.fillna(0)
+
+    df['sum-sum-nastnum-ratio'] = df['sum-sum-nastnum'].pct_change(1)
+    df['sum-sum-ntaxmny-ratio'] = df['sum-sum-ntaxmny'].pct_change(1)
+
+    # df = df.dropna().reset_index(drop=True)
+
+    df['ym'] = [str(x) + str(y) for x, y in zip(df['year'], df['month'])]
+    df['ym_code'] = LabelEncoder().fit_transform(df['ym'])
+    df['ym_code'] += 1
+
+    cols2 = ['billtype_code_1', 'billtype_code_2', 'billtype_code_3',
+             'billtype_code_4', 'billtype_code_5', 'billtype_code_6',
+             'billtype_code_7', 'billtype_code_8', 'class_code_1', 'class_code_2',
+             'class_code_3', 'class_code_4', 'class_code_5', 'city_code_1',
+             'city_code_2', 'city_code_3', 'city_code_4', 'city_code_5',
+             'city_code_6', 'city_code_7', 'city_code_8', 'city_code_9',
+             'sum-count-customno', 'sum-count-pk_org', 'sum-count-itemno',
+             'sum-sum-beds', 'sum-sum-nastnum', 'sum-sum-ntaxmny',
+             'sum-sum-nastnum-ratio', 'sum-sum-ntaxmny-ratio']
+
+    def lag_feature(df, lags, colname):
+        '''为每个样本增加lags天前的滞后特征'''
+        tmp = df[['ym_code', colname]].copy()
+        for i in lags:
+            shifted = tmp.copy()
+            shifted.columns = ['ym_code', colname + '_lag_' + str(i)]
+            shifted['ym_code'] += i
+            df = df.merge(shifted, on=['ym_code'], how='left')
+        return df
+
+    for c in cols2:
+        df = lag_feature(df, [1], c)
+
+    cols3 = ['billtype_code_1_lag_1', 'billtype_code_2_lag_1',
+             'billtype_code_3_lag_1', 'billtype_code_4_lag_1',
+             'billtype_code_5_lag_1', 'billtype_code_6_lag_1',
+             'billtype_code_7_lag_1', 'billtype_code_8_lag_1', 'class_code_1_lag_1',
+             'class_code_2_lag_1', 'class_code_3_lag_1', 'class_code_4_lag_1',
+             'class_code_5_lag_1', 'city_code_1_lag_1', 'city_code_2_lag_1',
+             'city_code_3_lag_1', 'city_code_4_lag_1', 'city_code_5_lag_1',
+             'city_code_6_lag_1', 'city_code_7_lag_1', 'city_code_8_lag_1',
+             'city_code_9_lag_1',
+             'sum-count-customno_lag_1', 'sum-count-pk_org_lag_1',
+             'sum-count-itemno_lag_1', 'sum-sum-beds_lag_1', 'sum-sum-nastnum_lag_1',
+             'sum-sum-ntaxmny_lag_1', 'sum-sum-nastnum-ratio_lag_1',
+             'sum-sum-ntaxmny-ratio_lag_1']
+
+    for c in cols3:
+        df['sum-2m-' + c] = df[c].rolling(2).sum()
+        df['sum-3m-' + c] = df[c].rolling(3).sum()
+
+        df['mean-2m-' + c] = df[c].rolling(2).mean()
+        df['mean-3m-' + c] = df[c].rolling(3).mean()
+
+        df['min-2m-' + c] = df[c].rolling(2).min()
+        df['min-3m-' + c] = df[c].rolling(3).min()
+
+        df['max-2m-' + c] = df[c].rolling(2).max()
+        df['max-3m-' + c] = df[c].rolling(3).max()
+
+    df = df.fillna(0)  # df = df.dropna()
+    df = df.sort_values(['ym']).reset_index(drop=True)
+
+    df['year'] = df['year'].astype(int)
+    df['month'] = df['month'].astype(int)
+    df['ym'] = df['ym'].astype(int)  # 全部改为数值型 不能用int，会直接变为整数。。。
+
+    '''
+    # df = pd.read_excel(r'SALE_MON4.xlsx')
+    '''
+    # ### qq
+    c01 = ['year']
+    c02 = ['month']
+    c1 = ['ym', 'ym_code']
+    c2 = ['billtype_code_1', 'billtype_code_2', 'billtype_code_3',
+          'billtype_code_4', 'billtype_code_5', 'billtype_code_6',
+          'billtype_code_7', 'billtype_code_8', 'class_code_1', 'class_code_2',
+          'class_code_3', 'class_code_4', 'class_code_5', 'city_code_1',
+          'city_code_2', 'city_code_3', 'city_code_4', 'city_code_5',
+          'city_code_6', 'city_code_7', 'city_code_8', 'city_code_9',
+          'sum-count-customno', 'sum-count-pk_org', 'sum-count-itemno',
+          'sum-sum-beds', 'sum-sum-nastnum', 'sum-sum-nastnum-ratio']
+    c3 = df.iloc[:, 34:64].columns.to_list()  # lag1
+    c4 = df.iloc[:, 64:304].columns.to_list()  # 聚合
+    c5 = ['sum-sum-ntaxmny']
+    c6 = ['sum-sum-ntaxmny-ratio']
+
+    # # ### ll
+    # c01 = ['year']
+    # c02 = ['month']
+    # c2 = ['hosp_mon','bed_mon','ypcount_mon','ypsum_mon','comp_mon',
+    #       'cust1_mon','cust2_mon','cust3_mon','cust4_mon','cust5_mon',
+    #       'city1_mon','city2_mon','city3_mon','city4_mon','city5_mon','city6_mon','city7_mon','city8_mon','city9_mon',
+    #       'type1_mon','type2_mon','type3_mon','type4_mon','type5_mon','type6_mon','type7_mon','type8_mon',
+    #       'ypsum_rate']
+    # c3 = df.columns[268:296].to_list()+df.columns[298:300].to_list()  # lag1
+    # c4 = df.columns[:240].to_list()  # 聚合
+    # c5 = ['sale_mon']
+    # c6 = ['sale_rate']
+    #
+    # clist = c02 + c2 + c5
+    # clist = c02 + c2 + c3 + c4 + c5
+    clist = c02 + c3 + c4 + c5
+
+    df1 = df[clist].copy()
+    # split data into X and y
+    X = df1.iloc[:, 0:len(df1.columns) - 1]
+    Y = df1.iloc[:, len(df1.columns) - 1]
+
+    # 把数据集拆分成训练集和测试集
+    X_train = X.iloc[:len(X) - n, :]
+    y_train = Y.iloc[:len(X) - n]
+    X_test = X.iloc[len(X) - n:, :]
+    y_test = Y.iloc[len(X) - n:]
+    y_test.loc[27] = 33028354
+
+    return X_train, y_train, X_test, y_test
+
+
+X_train, y_train, X_test, y_test = con_monthdf2(saleorder.copy(), 3)
+
+
+def con_monthdf3(df, n):
+    '''
+    df = saleorder.copy() 预测三个月n=3, 预测六个月n=6
+    '''
+    df['city_code'] = LabelEncoder().fit_transform(df['city'])  # 0-8
+    df['city_code'] += 1
+    df['class_code'] = LabelEncoder().fit_transform(df['custclass'])  # 0-4
+    df['class_code'] += 1
+    df['billtype_code'] = LabelEncoder().fit_transform(df['billtypename'])  # 0-7
+    df['billtype_code'] += 1
+    del df['city'], df['custclass'], df['billtypename']
+
+    groupcols2 = ['year', 'month']
+
+    df = df.groupby(groupcols2).apply(lambda x: groupcount2(x, 'city_code'))
+    df = df.groupby(groupcols2).apply(lambda x: groupcount2(x, 'class_code'))
+    df = df.groupby(groupcols2).apply(lambda x: groupcount2(x, 'billtype_code'))
+
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'count-customno'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'count-pk_org'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'count-itemno'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'sum-beds'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'sum-nastnum'))
+    df = df.groupby(groupcols2).apply(lambda x: groupsum(x, 'sum-ntaxmny'))
+
+    df = df[['billtype_code_1', 'billtype_code_2', 'billtype_code_3', 'billtype_code_4',
+             'billtype_code_5', 'billtype_code_6', 'billtype_code_7', 'billtype_code_8',
+             'class_code_1', 'class_code_2', 'class_code_3', 'class_code_4', 'class_code_5',
+             'city_code_1', 'city_code_2', 'city_code_3',
+             'city_code_4', 'city_code_5', 'city_code_6', 'city_code_7', 'city_code_8', 'city_code_9',
+             'month', 'year',
+             'sum-count-customno', 'sum-count-pk_org', 'sum-count-itemno',
+             'sum-sum-beds', 'sum-sum-nastnum', 'sum-sum-ntaxmny']].drop_duplicates()
+
+    df = df.fillna(0)
+
+    cols = ['billtype_code_1', 'billtype_code_2', 'billtype_code_3',
+            'billtype_code_4', 'billtype_code_5', 'billtype_code_6',
+            'billtype_code_7', 'billtype_code_8', 'class_code_1', 'class_code_2',
+            'class_code_3', 'class_code_4', 'class_code_5', 'city_code_1',
+            'city_code_2', 'city_code_3', 'city_code_4', 'city_code_5',
+            'city_code_6', 'city_code_7', 'city_code_8', 'city_code_9',
+            'sum-count-customno', 'sum-count-pk_org', 'sum-count-itemno',
+            'sum-sum-beds', 'sum-sum-nastnum', 'sum-sum-ntaxmny']
+    for c in cols:
+        df[c + '-ratio'] = df[c].pct_change(1)
+
+    # df = df.dropna().reset_index(drop=True)
+
+    df['ym'] = [str(x) + str(y) for x, y in zip(df['year'], df['month'])]
+    df['ym_code'] = LabelEncoder().fit_transform(df['ym'])
+    df['ym_code'] += 1
+
+    cols2 = ['billtype_code_1', 'billtype_code_2', 'billtype_code_3',
+             'billtype_code_4', 'billtype_code_5', 'billtype_code_6',
+             'billtype_code_7', 'billtype_code_8', 'class_code_1', 'class_code_2',
+             'class_code_3', 'class_code_4', 'class_code_5', 'city_code_1',
+             'city_code_2', 'city_code_3', 'city_code_4', 'city_code_5',
+             'city_code_6', 'city_code_7', 'city_code_8', 'city_code_9',
+             'sum-count-customno', 'sum-count-pk_org', 'sum-count-itemno',
+             'sum-sum-beds', 'sum-sum-nastnum', 'sum-sum-ntaxmny',
+
+             'billtype_code_1-ratio', 'billtype_code_2-ratio',
+             'billtype_code_3-ratio', 'billtype_code_4-ratio',
+             'billtype_code_5-ratio', 'billtype_code_6-ratio',
+             'billtype_code_7-ratio', 'billtype_code_8-ratio', 'class_code_1-ratio',
+             'class_code_2-ratio', 'class_code_3-ratio', 'class_code_4-ratio',
+             'class_code_5-ratio', 'city_code_1-ratio', 'city_code_2-ratio',
+             'city_code_3-ratio', 'city_code_4-ratio', 'city_code_5-ratio',
+             'city_code_6-ratio', 'city_code_7-ratio', 'city_code_8-ratio',
+             'city_code_9-ratio', 'sum-count-customno-ratio',
+             'sum-count-pk_org-ratio', 'sum-count-itemno-ratio',
+             'sum-sum-beds-ratio', 'sum-sum-nastnum-ratio', 'sum-sum-ntaxmny-ratio']
+
+    def lag_feature(df, lags, colname):
+        '''为每个样本增加lags天前的滞后特征'''
+        tmp = df[['ym_code', colname]].copy()
+        for i in lags:
+            shifted = tmp.copy()
+            shifted.columns = ['ym_code', colname + '_lag_' + str(i)]
+            shifted['ym_code'] += i
+            df = df.merge(shifted, on=['ym_code'], how='left')
+        return df
+
+    for c in cols2:
+        df = lag_feature(df, [1], c)
+
+    cols3 = ['billtype_code_1_lag_1',
+             'billtype_code_2_lag_1', 'billtype_code_3_lag_1',
+             'billtype_code_4_lag_1', 'billtype_code_5_lag_1',
+             'billtype_code_6_lag_1', 'billtype_code_7_lag_1',
+             'billtype_code_8_lag_1',
+             'class_code_1_lag_1', 'class_code_2_lag_1',
+             'class_code_3_lag_1', 'class_code_4_lag_1', 'class_code_5_lag_1',
+             'city_code_1_lag_1', 'city_code_2_lag_1', 'city_code_3_lag_1',
+             'city_code_4_lag_1', 'city_code_5_lag_1', 'city_code_6_lag_1',
+             'city_code_7_lag_1', 'city_code_8_lag_1', 'city_code_9_lag_1',
+             'sum-count-customno_lag_1', 'sum-count-pk_org_lag_1',
+             'sum-count-itemno_lag_1', 'sum-sum-beds_lag_1', 'sum-sum-nastnum_lag_1',
+             'sum-sum-ntaxmny_lag_1', 'billtype_code_1-ratio_lag_1',
+             'billtype_code_2-ratio_lag_1', 'billtype_code_3-ratio_lag_1',
+             'billtype_code_4-ratio_lag_1', 'billtype_code_5-ratio_lag_1',
+             'billtype_code_6-ratio_lag_1', 'billtype_code_7-ratio_lag_1',
+             'billtype_code_8-ratio_lag_1', 'class_code_1-ratio_lag_1',
+             'class_code_2-ratio_lag_1', 'class_code_3-ratio_lag_1',
+             'class_code_4-ratio_lag_1', 'class_code_5-ratio_lag_1',
+             'city_code_1-ratio_lag_1', 'city_code_2-ratio_lag_1',
+             'city_code_3-ratio_lag_1', 'city_code_4-ratio_lag_1',
+             'city_code_5-ratio_lag_1', 'city_code_6-ratio_lag_1',
+             'city_code_7-ratio_lag_1', 'city_code_8-ratio_lag_1',
+             'city_code_9-ratio_lag_1', 'sum-count-customno-ratio_lag_1',
+             'sum-count-pk_org-ratio_lag_1', 'sum-count-itemno-ratio_lag_1',
+             'sum-sum-beds-ratio_lag_1', 'sum-sum-nastnum-ratio_lag_1',
+             'sum-sum-ntaxmny-ratio_lag_1']
+
+    for c in cols3:
+        df['sum-2m-' + c] = df[c].rolling(2).sum()
+        df['sum-3m-' + c] = df[c].rolling(3).sum()
+
+        df['mean-2m-' + c] = df[c].rolling(2).mean()
+        df['mean-3m-' + c] = df[c].rolling(3).mean()
+
+        df['min-2m-' + c] = df[c].rolling(2).min()
+        df['min-3m-' + c] = df[c].rolling(3).min()
+
+        df['max-2m-' + c] = df[c].rolling(2).max()
+        df['max-3m-' + c] = df[c].rolling(3).max()
+
+    df = df.fillna(0)  # df = df.dropna()
+    df = df.sort_values(['ym']).reset_index(drop=True)
+
+    df['year'] = df['year'].astype(int)
+    df['month'] = df['month'].astype(int)
+    df['ym'] = df['ym'].astype(int)  # 全部改为数值型 不能用int，会直接变为整数。。。
+
+    '''
+    # df = pd.read_excel(r'SALE_MON4.xlsx')
+    '''
+    # ### qq
+    c01 = ['year']
+    c02 = ['month']
+    c1 = ['ym', 'ym_code']
+    c2 = ['billtype_code_1', 'billtype_code_2', 'billtype_code_3',
+          'billtype_code_4', 'billtype_code_5', 'billtype_code_6',
+          'billtype_code_7', 'billtype_code_8', 'class_code_1', 'class_code_2',
+          'class_code_3', 'class_code_4', 'class_code_5', 'city_code_1',
+          'city_code_2', 'city_code_3', 'city_code_4', 'city_code_5',
+          'city_code_6', 'city_code_7', 'city_code_8', 'city_code_9',
+          'sum-count-customno', 'sum-count-pk_org', 'sum-count-itemno',
+          'sum-sum-beds', 'sum-sum-nastnum',
+          'billtype_code_1-ratio', 'billtype_code_2-ratio',
+          'billtype_code_3-ratio', 'billtype_code_4-ratio',
+          'billtype_code_5-ratio', 'billtype_code_6-ratio',
+          'billtype_code_7-ratio', 'billtype_code_8-ratio', 'class_code_1-ratio',
+          'class_code_2-ratio', 'class_code_3-ratio', 'class_code_4-ratio',
+          'class_code_5-ratio', 'city_code_1-ratio', 'city_code_2-ratio',
+          'city_code_3-ratio', 'city_code_4-ratio', 'city_code_5-ratio',
+          'city_code_6-ratio', 'city_code_7-ratio', 'city_code_8-ratio',
+          'city_code_9-ratio', 'sum-count-customno-ratio',
+          'sum-count-pk_org-ratio', 'sum-count-itemno-ratio',
+          'sum-sum-beds-ratio', 'sum-sum-nastnum-ratio']
+    c3 = df.iloc[:, 60:116].columns.to_list()  # lag1
+    c4 = df.iloc[:, 116:].columns.to_list()  # 聚合
+    c5 = ['sum-sum-ntaxmny']
+    c6 = ['sum-sum-ntaxmny-ratio']
+
+    clist = c02 + c3 + c4 + c5
+    df1 = df[clist].copy()
+    # split data into X and y
+    X = df1.iloc[:, 0:len(df1.columns) - 1]
+    Y = df1.iloc[:, len(df1.columns) - 1]
+
+    # 把数据集拆分成训练集和测试集
+    X_train = X.iloc[:len(X) - n, :]
+    y_train = Y.iloc[:len(X) - n]
+    X_test = X.iloc[len(X) - n:, :]
+    y_test = Y.iloc[len(X) - n:]
+    y_test.loc[27] = 33028354
+
+    return X_train, y_train, X_test, y_test
+
+
+'''#################################################### 日度模型1 #####################################################'''
+
+
+def con_dailydf1(df):
+    '''no特征工程'''
+
+    temp = df[['city', 'custclass', 'billtypename']].copy()
+    temp = pd.get_dummies(temp)
+    df = pd.concat([temp, df], axis=1)
+    df = df[['city_东营市', 'city_威海市', 'city_德州市', 'city_日照市', 'city_济南市', 'city_济宁市', 'city_淄博市',
+             'city_潍坊市', 'city_菏泽市',
+
+             'custclass_三级乙等', 'custclass_三级未定', 'custclass_三级甲等', 'custclass_二级未定', 'custclass_二级甲等',
+
+             'billtypename_器械销售', 'billtypename_基药销售', 'billtypename_普通', 'billtypename_特殊药品销售',
+             'billtypename_现款销售', 'billtypename_退换货', 'billtypename_销售调整入', 'billtypename_销售调整出',
+
+             'everyday', 'year', 'month', 'day',
+
+             'count-customno', 'count-pk_org', 'count-itemno',
+
+             'sum-beds', 'sum-nastnum', 'sum-ntaxmny']].drop_duplicates()
+
+    df_cols = df.columns
+    df_cols = df_cols.drop('everyday')
+    for x in df_cols:
+        df[x] = [int(i) for i in df[x]]  # # 全部改为数值型
+
+    # split data into X and y
+    X = df.iloc[:, 0:len(df.columns) - 1]
+    Y = df.iloc[:, len(df.columns) - 1]
+
+    # 把数据集拆分成训练集和测试集
+    X_train = X[(X['everyday'] > '2017-12-31') & (X['everyday'] < '2019-10-01')]
+    y_train = Y.loc[X_train.index]
+    X_test = X[(X['everyday'] >= '2019-10-01')]
+    y_test = Y.loc[X_test.index]
+    del X_train['everyday'], X_test['everyday'], X_train['sum-nastnum'], X_test['sum-nastnum'], X_train['year'], X_test[
+        'year']
+
+    return X_train, y_train, X_test, y_test
+
+
+X_train, y_train, X_test, y_test = con_dailydf1(saleorder1.copy())
+
+'''#################################################### 日度模型2 #####################################################'''
+
+
+def con_dailydf2(df):
+    '''with特征工程'''
+    # # df = saleorder1.copy()
+    temp = df[['city', 'custclass', 'billtypename']].copy()
+    temp = pd.get_dummies(temp)
+    df = pd.concat([temp, df], axis=1)
+    del temp
+
+    cols1 = ['city_东营市', 'city_威海市', 'city_德州市', 'city_日照市', 'city_济南市', 'city_济宁市', 'city_淄博市',
+             'city_潍坊市', 'city_菏泽市',
+             'custclass_三级乙等', 'custclass_三级未定', 'custclass_三级甲等', 'custclass_二级未定', 'custclass_二级甲等',
+             'billtypename_器械销售', 'billtypename_基药销售', 'billtypename_普通', 'billtypename_特殊药品销售',
+             'billtypename_现款销售', 'billtypename_退换货', 'billtypename_销售调整入', 'billtypename_销售调整出',
+             'everyday', 'year', 'month', 'day',
+             'count-customno', 'count-pk_org', 'count-itemno',
+             'sum-beds', 'sum-nastnum', 'sum-ntaxmny']
+    df = df[cols1].drop_duplicates()
+
+    # ### 先按每天聚合sum
+    df_sum = df.groupby('everyday').sum().reset_index()
+    df_sum_cols = []
+    for d in df_sum.columns:
+        df_sum_cols.append('sum_' + d)
+    df_sum.columns = df_sum_cols
+    df_sum.rename(columns={'sum_everyday': 'everyday'}, inplace=True)
+
+    # # 全日历日
+    tempdays = df_sum['everyday'].sort_values().values
+    alldays = pd.DataFrame({'everyday': [x.strftime('%Y-%m-%d') for x in pd.date_range(tempdays[0], tempdays[-1])]})
+    alldays['day_code'] = LabelEncoder().fit_transform(alldays['everyday'])
+
+    df_sum1 = df_sum.merge(alldays, on='everyday', how='right').sort_values('everyday')
+    df_sum1 = df_sum1.fillna(0).reset_index(drop=True)
+
+    df_sum1['sum_sum-nastnum-ratio'] = df_sum1['sum_sum-nastnum'].pct_change(1)
+    df_sum1['sum_sum-ntaxmny-ratio'] = df_sum1['sum_sum-ntaxmny'].pct_change(1)
+
+    df_sum1['sum_sum-nastnum-ratio'] = [0 if (math.isnan(a) | math.isinf(a) | (a == -1)) else a for a in
+                                        df_sum1['sum_sum-nastnum-ratio']]
+    df_sum1['sum_sum-ntaxmny-ratio'] = [0 if (math.isnan(a) | math.isinf(a) | (a == -1)) else a for a in
+                                        df_sum1['sum_sum-ntaxmny-ratio']]
+
+    df_sum1 = df_sum1.dropna()
+
+    def lag_feature(df, lags, colname):
+        '''为每个样本增加lags天前的滞后特征'''
+        tmp = df[['day_code', colname]].copy()
+        for i in lags:
+            shifted = tmp.copy()
+            shifted.columns = ['day_code', colname + '_lag_' + str(i)]
+            shifted['day_code'] += i
+            df = df.merge(shifted, on=['day_code'], how='left')
+        return df
+
+    cols2 = ['sum_city_东营市',
+             'sum_city_威海市',
+             'sum_city_德州市',
+             'sum_city_日照市',
+             'sum_city_济南市',
+             'sum_city_济宁市',
+             'sum_city_淄博市',
+             'sum_city_潍坊市',
+             'sum_city_菏泽市',
+             'sum_custclass_三级乙等',
+             'sum_custclass_三级未定',
+             'sum_custclass_三级甲等',
+             'sum_custclass_二级未定',
+             'sum_custclass_二级甲等',
+             'sum_billtypename_器械销售',
+             'sum_billtypename_基药销售',
+             'sum_billtypename_普通',
+             'sum_billtypename_特殊药品销售',
+             'sum_billtypename_现款销售',
+             'sum_billtypename_退换货',
+             'sum_billtypename_销售调整入',
+             'sum_billtypename_销售调整出',
+             'sum_count-customno',
+             'sum_count-pk_org',
+             'sum_count-itemno',
+             'sum_sum-beds',
+             'sum_sum-nastnum',
+             'sum_sum-ntaxmny',
+             'sum_sum-nastnum-ratio',
+             'sum_sum-ntaxmny-ratio']
+
+    for c in cols2:
+        df_sum1 = lag_feature(df_sum1, [1], c)
+
+    cols3 = ['sum_city_东营市_lag_1',
+             'sum_city_威海市_lag_1',
+             'sum_city_德州市_lag_1',
+             'sum_city_日照市_lag_1',
+             'sum_city_济南市_lag_1',
+             'sum_city_济宁市_lag_1',
+             'sum_city_淄博市_lag_1',
+             'sum_city_潍坊市_lag_1',
+             'sum_city_菏泽市_lag_1',
+             'sum_custclass_三级乙等_lag_1',
+             'sum_custclass_三级未定_lag_1',
+             'sum_custclass_三级甲等_lag_1',
+             'sum_custclass_二级未定_lag_1',
+             'sum_custclass_二级甲等_lag_1',
+             'sum_billtypename_器械销售_lag_1',
+             'sum_billtypename_基药销售_lag_1',
+             'sum_billtypename_普通_lag_1',
+             'sum_billtypename_特殊药品销售_lag_1',
+             'sum_billtypename_现款销售_lag_1',
+             'sum_billtypename_退换货_lag_1',
+             'sum_billtypename_销售调整入_lag_1',
+             'sum_billtypename_销售调整出_lag_1',
+             'sum_count-customno_lag_1',
+             'sum_count-pk_org_lag_1',
+             'sum_count-itemno_lag_1',
+             'sum_sum-beds_lag_1',
+             'sum_sum-nastnum_lag_1',
+             'sum_sum-ntaxmny_lag_1',
+             'sum_sum-nastnum-ratio_lag_1',
+             'sum_sum-ntaxmny-ratio_lag_1']
+
+    for c in cols3:
+        df_sum1['sum-1w-' + c] = df_sum1[c].rolling(7).sum()
+        df_sum1['sum-1m-' + c] = df_sum1[c].rolling(30).sum()
+        df_sum1['sum-3m-' + c] = df_sum1[c].rolling(90).sum()
+
+        df_sum1['mean-1w-' + c] = df_sum1[c].rolling(7).mean()
+        df_sum1['mean-1m-' + c] = df_sum1[c].rolling(30).mean()
+        df_sum1['mean-3m-' + c] = df_sum1[c].rolling(90).mean()
+
+        df_sum1['min-1w-' + c] = df_sum1[c].rolling(7).min()
+        df_sum1['min-1m-' + c] = df_sum1[c].rolling(30).min()
+        df_sum1['min-3m-' + c] = df_sum1[c].rolling(90).min()
+
+        df_sum1['max-1w-' + c] = df_sum1[c].rolling(7).max()
+        df_sum1['max-1m-' + c] = df_sum1[c].rolling(30).max()
+        df_sum1['max-3m-' + c] = df_sum1[c].rolling(90).max()
+
+    df_sum1 = df_sum1.dropna().reset_index(drop=True)
+
+    df1 = df.merge(df_sum1, on='everyday', how='left')
+    df1 = df1.dropna().reset_index(drop=True)
+    df1_cols = df1.columns
+    df1_cols = df1_cols.drop('everyday')
+    for x in df1_cols:
+        df1[x] = [int(i) for i in df1[x]]  # # 全部改为数值型
+
+    # # df1.to_hdf(r'df1.h5', 'df1')
+    # ###
+    # ##
+    # #
+    #
+
+    '''
+    df1.iloc[:,60:61].columns
+Index(['day_code'], dtype='object')
+    '''
+
+    '''
+    df1.iloc[:,61:89].columns
+Index(['sum_city_东营市_lag_1', 'sum_city_威海市_lag_1', 'sum_city_德州市_lag_1',
+       'sum_city_日照市_lag_1', 'sum_city_济南市_lag_1', 'sum_city_济宁市_lag_1',
+       'sum_city_淄博市_lag_1', 'sum_city_潍坊市_lag_1', 'sum_city_菏泽市_lag_1',
+       'sum_custclass_三级乙等_lag_1', 'sum_custclass_三级未定_lag_1',
+       'sum_custclass_三级甲等_lag_1', 'sum_custclass_二级未定_lag_1',
+       'sum_custclass_二级甲等_lag_1', 'sum_billtypename_器械销售_lag_1',
+       'sum_billtypename_基药销售_lag_1', 'sum_billtypename_普通_lag_1',
+       'sum_billtypename_特殊药品销售_lag_1', 'sum_billtypename_现款销售_lag_1',
+       'sum_billtypename_退换货_lag_1', 'sum_billtypename_销售调整入_lag_1',
+       'sum_billtypename_销售调整出_lag_1', 'sum_count-customno_lag_1',
+       'sum_count-pk_org_lag_1', 'sum_count-itemno_lag_1',
+       'sum_sum-beds_lag_1', 'sum_sum-nastnum_lag_1', 'sum_sum-ntaxmny_lag_1'],
+      dtype='object')
+    '''
+
+    '''
+    df1.iloc[:,89:].columns
+Index(['sum-1w-sum_city_东营市', 'sum-1m-sum_city_东营市', 'sum-3m-sum_city_东营市',
+       'mean-1w-sum_city_东营市', 'mean-1m-sum_city_东营市', 'mean-3m-sum_city_东营市',
+       'min-1w-sum_city_东营市', 'min-1m-sum_city_东营市', 'min-3m-sum_city_东营市',
+       'max-1w-sum_city_东营市',
+       ...
+       'sum-3m-sum_sum-ntaxmny', 'mean-1w-sum_sum-ntaxmny',
+       'mean-1m-sum_sum-ntaxmny', 'mean-3m-sum_sum-ntaxmny',
+       'min-1w-sum_sum-ntaxmny', 'min-1m-sum_sum-ntaxmny',
+       'min-3m-sum_sum-ntaxmny', 'max-1w-sum_sum-ntaxmny',
+       'max-1m-sum_sum-ntaxmny', 'max-3m-sum_sum-ntaxmny'],
+      dtype='object', length=336)
+    '''
+
+    c0 = ['everyday', 'year', 'month', 'day']
+
+    c1 = ['city_东营市', 'city_威海市', 'city_德州市', 'city_日照市', 'city_济南市', 'city_济宁市',
+          'city_淄博市', 'city_潍坊市', 'city_菏泽市', 'custclass_三级乙等', 'custclass_三级未定',
+          'custclass_三级甲等', 'custclass_二级未定', 'custclass_二级甲等',
+          'billtypename_器械销售', 'billtypename_基药销售', 'billtypename_普通',
+          'billtypename_特殊药品销售', 'billtypename_现款销售', 'billtypename_退换货',
+          'billtypename_销售调整入', 'billtypename_销售调整出',
+          'count-customno', 'count-pk_org', 'count-itemno', 'sum-beds', 'sum-nastnum']
+
+    c2 = ['sum_city_东营市', 'sum_city_威海市', 'sum_city_德州市', 'sum_city_日照市',
+          'sum_city_济南市', 'sum_city_济宁市', 'sum_city_淄博市', 'sum_city_潍坊市',
+          'sum_city_菏泽市', 'sum_custclass_三级乙等', 'sum_custclass_三级未定',
+          'sum_custclass_三级甲等', 'sum_custclass_二级未定', 'sum_custclass_二级甲等',
+          'sum_billtypename_器械销售', 'sum_billtypename_基药销售', 'sum_billtypename_普通',
+          'sum_billtypename_特殊药品销售', 'sum_billtypename_现款销售',
+          'sum_billtypename_退换货', 'sum_billtypename_销售调整入',
+          'sum_billtypename_销售调整出', 'sum_count-customno', 'sum_count-pk_org',
+          'sum_count-itemno', 'sum_sum-beds', 'sum_sum-nastnum',
+          'sum_sum-ntaxmny', 'sum_sum-nastnum-ratio', 'sum_sum-ntaxmny-ratio']
+
+    c3 = df1.iloc[:, 63:93].columns.to_list()  # lag1
+
+    c4 = df1.iloc[:, 93:].columns.to_list()  # 聚合
+
+    c5 = ['day_code']
+
+    c6 = ['sum-ntaxmny']
+
+    # clist = c0 + c1 + c2 + c3 + c4 + c5 + c6
+    clist = c0 + c2 + c3 + c4 + c6
+    df1 = pd.read_hdf(r'df_day.h5')
+    df1 = df1[clist]
+
+    # split data into X and y
+    X = df1.iloc[:, 0:len(df1.columns) - 1]
+    Y = df1.iloc[:, len(df1.columns) - 1]
+
+    # 把数据集拆分成训练集和测试集
+    X_train = X[(X['everyday'] > '2017-12-31') & (X['everyday'] < '2019-10-01')]
+    y_train = Y.loc[X_train.index]
+    X_test = X[(X['everyday'] >= '2019-10-01')]
+    y_test = Y.loc[X_test.index]
+    # del X_train['everyday'], X_test['everyday'], X_train['day_code'], X_test['day_code'], \
+    #     X_train['sum-nastnum'], X_test['sum-nastnum'], X_train['year'], X_test['year']
+    del X_train['everyday'], X_test['everyday'], X_train['year'], X_test['year']
+
+    return X_train, y_train, X_test, y_test
+
+
+X_train, y_train, X_test, y_test = con_dailydf2(saleorder1.copy())
+
+
+
+
+'''#################################################### 模型拟合 ######################################################'''
+
+
+
+
+
+# xgboost.cv()
+# 拟合XGBoost模型
+
+del model
+n = 4
+X_train, y_train, X_test, y_test = con_monthdf2(saleorder.copy(), n)
+
+redf = pd.DataFrame()
+id = 0
+for la in np.arange(0.5, 1.5, 0.1):
+    for et in np.arange(0.1, 0.6, 0.1):
+        for md in np.arange(3, 10):
+            model = XGBRegressor(max_depth=md, n_estimators=10000, min_child_weight=1,
+                                 colsample_bytree=0.8, subsample=0.8, eta=et,
+                                 seed=0, n_jobs=-1, gamma=0, reg_lambda=la)
+            model.fit(X_train, y_train, eval_metric='rmse', eval_set=[(X_test, y_test)], verbose=False,
+                      early_stopping_rounds=10)
+            y_pred = model.predict(X_test)
+            # xgboost.plot_importance(model)
+            # xgboost.plot_tree(model)
+            re = pd.DataFrame({'pred': y_pred, 'test': y_test}, index=y_test.index)
+
+            re['month'] = X_test.loc[re.index]['month'].astype(str)
+            # re['year-month'] = [x+'-'+y for x,y in zip(re['year'],re['month'])]
+            re1 = re.groupby('month').sum().reset_index()
+            re1['ratio'] = re1['pred'] / re1['test'] - 1
+            # print(re1)
+            re1['ratio-mean'] = abs(re1['ratio']).mean()
+            re1['ratio-min'] = abs(re1['ratio']).min()
+            re1['ratio-max'] = abs(re1['ratio']).max()
+            re1['maxdown'] = md
+            re1['learningrate'] = et
+            re1['lambda'] = la
+            re1['best_score'] = model.best_score
+            re1['best_iteration'] = model.best_iteration
+            re1['id'] = id
+            redf = redf.append(re1)
+            id += 1
+            # print(md, '---', abs(re1['ratio']).mean(), abs(re1['ratio']).min(), abs(re1['ratio']).max())
+redf.to_excel(r'result_month_'+str(n)+'_fillna_.xlsx', index=False)
